@@ -84,11 +84,15 @@ in vec2 a_position;
 uniform vec2 u_scale;
 uniform vec2 u_offset;
 uniform vec2 u_resolution;
+uniform bool u_flip_uv_y;
 
 out vec2 v_uv;
 
 void main() {
-    v_uv = a_position; // unit quad: position == UV
+    v_uv = a_position;
+    if (u_flip_uv_y) {
+        v_uv.y = 1.0 - v_uv.y;
+    }
 
     vec2 world = u_offset + u_scale * a_position;
     vec2 ndc = (world / u_resolution) * 2.0 - 1.0;

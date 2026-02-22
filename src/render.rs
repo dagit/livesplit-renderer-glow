@@ -34,6 +34,7 @@ struct ImageUniforms {
     offset: glow::UniformLocation,
     resolution: glow::UniformLocation,
     texture: glow::UniformLocation,
+    flip_uv_y: glow::UniformLocation,
 }
 
 /// A GPU-accelerated renderer for livesplit-core layouts.
@@ -115,6 +116,9 @@ impl GlowRenderer {
                 .unwrap(),
             texture: gl
                 .get_uniform_location(image_program, "u_texture")
+                .unwrap(),
+            flip_uv_y: gl
+                .get_uniform_location(image_program, "u_flip_uv_y")
                 .unwrap(),
         };
 
@@ -428,6 +432,7 @@ impl GlowRenderer {
             transform.scale_y,
         );
         gl.uniform_2_f32(Some(&self.image_uniforms.offset), transform.x, transform.y);
+        gl.uniform_1_i32(Some(&self.image_uniforms.flip_uv_y), 0);
 
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -533,6 +538,7 @@ impl GlowRenderer {
         );
         gl.uniform_2_f32(Some(&self.image_uniforms.scale), resolution[0], resolution[1]);
         gl.uniform_2_f32(Some(&self.image_uniforms.offset), 0.0, 0.0);
+        gl.uniform_1_i32(Some(&self.image_uniforms.flip_uv_y), 1);
 
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.fbo_texture));
