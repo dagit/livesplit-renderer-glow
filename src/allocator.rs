@@ -81,7 +81,7 @@ pub fn tessellate_stroke(path: &Option<GlPath>, stroke_width: f32) -> Option<GlP
     // TODO: Store the original lyon::path::Path alongside the tessellated mesh
     // so we can properly stroke-tessellate here.
     let _ = stroke_width;
-    path.as_ref().map(|p| p.clone())
+    path.clone()
 }
 
 /// The resource allocator that wires everything together.

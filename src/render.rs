@@ -51,6 +51,9 @@ struct ImageUniforms {
 ///     renderer.render(&layout_state, &image_cache, [width, height]);
 /// }
 /// ```
+/// Number of MSAA samples for antialiasing.
+const MSAA_SAMPLES: i32 = 4;
+
 pub struct GlowRenderer {
     gl: Arc<glow::Context>,
     allocator: GlAllocator,
@@ -65,9 +68,14 @@ pub struct GlowRenderer {
     vbo: glow::Buffer,
     ebo: glow::Buffer,
 
-    // Bottom-layer caching
+    // Bottom-layer caching (non-MSAA, used as texture source for blitting)
     fbo: glow::Framebuffer,
     fbo_texture: glow::Texture,
+
+    // MSAA rendering target
+    msaa_fbo: glow::Framebuffer,
+    msaa_rbo: glow::Renderbuffer,
+
     fbo_size: [u32; 2],
     bottom_layer_dirty: bool,
 }
@@ -141,9 +149,13 @@ impl GlowRenderer {
         );
         gl.bind_vertex_array(None);
 
-        // Create FBO for bottom-layer caching
+        // Create FBO for bottom-layer caching (resolve target)
         let fbo = gl.create_framebuffer()?;
         let fbo_texture = gl.create_texture()?;
+
+        // Create MSAA FBO for antialiased rendering
+        let msaa_fbo = gl.create_framebuffer()?;
+        let msaa_rbo = gl.create_renderbuffer()?;
 
         let mut allocator = GlAllocator::new();
         let scene_manager = SceneManager::new(&mut allocator);
@@ -161,6 +173,8 @@ impl GlowRenderer {
             ebo,
             fbo,
             fbo_texture,
+            msaa_fbo,
+            msaa_rbo,
             fbo_size: [0, 0],
             bottom_layer_dirty: true,
         })
@@ -204,10 +218,13 @@ impl GlowRenderer {
         gl.enable(glow::BLEND);
         gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
 
+        let w = width as i32;
+        let h = height as i32;
+
         if bottom_layer_changed || self.bottom_layer_dirty {
-            // Render bottom layer into FBO
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
-            gl.viewport(0, 0, width as i32, height as i32);
+            // Render bottom layer into MSAA FBO
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.msaa_fbo));
+            gl.viewport(0, 0, w, h);
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
 
@@ -221,22 +238,32 @@ impl GlowRenderer {
                 self.render_entity(entity, resolution);
             }
 
-            self.bottom_layer_dirty = false;
+            // Resolve MSAA → cached texture
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.msaa_fbo));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo));
+            gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
 
-            // Switch back to default framebuffer
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.bottom_layer_dirty = false;
         }
 
-        // Blit the cached bottom layer to the screen
-        gl.viewport(0, 0, width as i32, height as i32);
+        // Composite: blit cached bottom layer + render top layer, all into MSAA FBO
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.msaa_fbo));
+        gl.viewport(0, 0, w, h);
         gl.clear_color(0.0, 0.0, 0.0, 0.0);
         gl.clear(glow::COLOR_BUFFER_BIT);
+
+        // Draw cached bottom layer texture into MSAA FBO
         self.blit_fbo(resolution);
 
-        // Render top layer directly to screen
+        // Render top layer into MSAA FBO
         for entity in scene.top_layer() {
             self.render_entity(entity, resolution);
         }
+
+        // Resolve MSAA → default framebuffer (screen)
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.msaa_fbo));
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+        gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
 
         gl.disable(glow::BLEND);
 
@@ -403,7 +430,7 @@ impl GlowRenderer {
                 let glyph_shader = if let Some(color) = &glyph.color {
                     FillShader::SolidColor(*color)
                 } else {
-                    shader.clone()
+                    *shader
                 };
                 self.draw_path(path, &glyph_shader, &t, resolution);
             }
@@ -553,10 +580,11 @@ impl GlowRenderer {
         gl.bind_texture(glow::TEXTURE_2D, None);
     }
 
-    /// Resize (or initially create) the FBO color attachment.
+    /// Resize (or initially create) both the resolve FBO and MSAA FBO.
     unsafe fn resize_fbo(&mut self, width: u32, height: u32) {
         let gl = &self.gl;
 
+        // Set up the resolve target (non-MSAA texture)
         gl.bind_texture(glow::TEXTURE_2D, Some(self.fbo_texture));
         gl.tex_image_2d(
             glow::TEXTURE_2D,
@@ -589,7 +617,26 @@ impl GlowRenderer {
             0,
         );
 
+        // Set up the MSAA renderbuffer
+        gl.bind_renderbuffer(glow::RENDERBUFFER, Some(self.msaa_rbo));
+        gl.renderbuffer_storage_multisample(
+            glow::RENDERBUFFER,
+            MSAA_SAMPLES,
+            glow::RGBA8,
+            width as i32,
+            height as i32,
+        );
+
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.msaa_fbo));
+        gl.framebuffer_renderbuffer(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::RENDERBUFFER,
+            Some(self.msaa_rbo),
+        );
+
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.bind_renderbuffer(glow::RENDERBUFFER, None);
         gl.bind_texture(glow::TEXTURE_2D, None);
 
         self.fbo_size = [width, height];
@@ -609,6 +656,8 @@ impl GlowRenderer {
         gl.delete_buffer(self.ebo);
         gl.delete_framebuffer(self.fbo);
         gl.delete_texture(self.fbo_texture);
+        gl.delete_framebuffer(self.msaa_fbo);
+        gl.delete_renderbuffer(self.msaa_rbo);
     }
 }
 
