@@ -2,9 +2,12 @@
 name = "livesplit-renderer-glow"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 description = "A GPU-accelerated renderer for livesplit-core using OpenGL via glow"
 repository = "https://github.com/dagit/livesplit-renderer-glow"
+keywords = ["livesplit", "opengl", "glow", "rendering", "speedrun"]
+categories = ["rendering", "graphics"]
 
 [dependencies]
 livesplit-core = { git = "https://github.com/LiveSplit/livesplit-core", features = ["default-text-engine", "font-loading"] }
@@ -12,3 +15,11 @@ glow = "0.16"
 lyon = "1"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
