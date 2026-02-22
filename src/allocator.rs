@@ -1,15 +1,17 @@
 //! [`ResourceAllocator`] implementation that tessellates paths via lyon and
 //! delegates text shaping to livesplit-core's default text engine.
 
-use livesplit_core::rendering::{
-    self, default_text_engine::TextEngine, FontKind, ResourceAllocator,
+use livesplit_core::{
+    rendering::{self, default_text_engine::TextEngine, FontKind, ResourceAllocator},
+    settings,
 };
-use livesplit_core::settings;
-use lyon::math::point;
-use lyon::path::Path as LyonPath;
-use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillRule, FillTessellator, FillVertex, StrokeOptions,
-    StrokeTessellator, StrokeVertex, VertexBuffers,
+use lyon::{
+    math::point,
+    path::Path as LyonPath,
+    tessellation::{
+        BuffersBuilder, FillOptions, FillRule, FillTessellator, FillVertex, StrokeOptions,
+        StrokeTessellator, StrokeVertex, VertexBuffers,
+    },
 };
 use std::sync::Arc;
 

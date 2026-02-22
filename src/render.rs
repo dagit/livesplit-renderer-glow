@@ -4,16 +4,18 @@
 //! [`Scene`]: livesplit_core::rendering::Scene
 
 use glow::{HasContext, PixelUnpackData};
-use livesplit_core::layout::LayoutState;
-use livesplit_core::rendering::{
-    Background, Entity, FillShader, Handle, LabelHandle, SceneManager, Transform,
+use livesplit_core::{
+    layout::LayoutState,
+    rendering::{Background, Entity, FillShader, Handle, LabelHandle, SceneManager, Transform},
+    settings::{BackgroundImage, ImageCache},
 };
-use livesplit_core::settings::{BackgroundImage, ImageCache};
 use std::sync::Arc;
 
-use crate::allocator::{self, GlAllocator};
-use crate::shaders;
-use crate::types::{GlFont, GlImage, GlLabel, GlPath, Vertex};
+use crate::{
+    allocator::{self, GlAllocator},
+    shaders,
+    types::{GlFont, GlImage, GlLabel, GlPath, Vertex},
+};
 
 /// Shadow offset in component coordinate space.
 ///
