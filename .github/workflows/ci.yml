@@ -51,12 +51,12 @@ jobs:
       - run: cargo doc --no-deps
 
   msrv:
-    name: MSRV (1.80)
+    name: MSRV (1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.80"
+          toolchain: "1.89"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check
