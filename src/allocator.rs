@@ -25,13 +25,20 @@ use crate::types::{GlFont, GlImage, GlImageData, GlLabel, GlPath, Vertex};
 pub struct GlPathBuilder {
     /// The underlying lyon path builder.
     builder: lyon::path::path::Builder,
+    /// Whether a sub-path has been opened (via `begin`) but not yet closed.
+    /// Lyon panics if `build()` is called while a sub-path is still open.
+    sub_path_open: bool,
 }
 
 impl rendering::PathBuilder for GlPathBuilder {
     type Path = Option<GlPath>;
 
     fn move_to(&mut self, x: f32, y: f32) {
+        if self.sub_path_open {
+            self.builder.end(false);
+        }
         self.builder.begin(point(x, y));
+        self.sub_path_open = true;
     }
 
     fn line_to(&mut self, x: f32, y: f32) {
@@ -49,9 +56,13 @@ impl rendering::PathBuilder for GlPathBuilder {
 
     fn close(&mut self) {
         self.builder.close();
+        self.sub_path_open = false;
     }
 
-    fn finish(self) -> Self::Path {
+    fn finish(mut self) -> Self::Path {
+        if self.sub_path_open {
+            self.builder.end(false);
+        }
         let path = self.builder.build();
         tessellate_path(&path)
     }
@@ -157,6 +168,7 @@ impl ResourceAllocator for GlAllocator {
     fn path_builder(&mut self) -> Self::PathBuilder {
         GlPathBuilder {
             builder: LyonPath::builder(),
+            sub_path_open: false,
         }
     }
 
@@ -208,6 +220,7 @@ impl ResourceAllocator for GlAllocator {
 fn gl_path_builder() -> GlPathBuilder {
     GlPathBuilder {
         builder: LyonPath::builder(),
+        sub_path_open: false,
     }
 }
 
@@ -400,6 +413,29 @@ mod tests {
         // Different width should miss the cache.
         let cached = path.cached_stroke(0.2);
         assert!(cached.is_none(), "cache should miss for different width");
+    }
+
+    #[test]
+    fn finish_without_close_does_not_panic() {
+        // Simulates what livesplit-core's graph component does: open paths
+        // (move_to + line_to) without a closing close() call.
+        let mut pb = gl_path_builder();
+        pb.move_to(0.0, 0.0);
+        pb.line_to(1.0, 0.0);
+        pb.line_to(1.0, 1.0);
+        // No close() — finish() should end the sub-path automatically.
+        let _result = pb.finish();
+    }
+
+    #[test]
+    fn multiple_open_subpaths_does_not_panic() {
+        // Multiple move_to calls without close in between.
+        let mut pb = gl_path_builder();
+        pb.move_to(0.0, 0.0);
+        pb.line_to(1.0, 0.0);
+        pb.move_to(2.0, 0.0);
+        pb.line_to(3.0, 0.0);
+        let _result = pb.finish();
     }
 
     #[test]
