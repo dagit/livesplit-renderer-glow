@@ -9,19 +9,34 @@ use livesplit_core::{
     rendering::{Background, Entity, FillShader, Handle, LabelHandle, SceneManager, Transform},
     settings::{BackgroundImage, ImageCache},
 };
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 use crate::{
     common::{tessellate_stroke, vertex_bounds, BLUR_FACTOR, SHADOW_OFFSET},
     wgpu_allocator::WgpuAllocator,
+    wgpu_buffer_pool::FrameBufferPool,
     wgpu_shaders,
     wgpu_types::{WgpuFont, WgpuImage, WgpuLabel, WgpuPath},
 };
 
 /// Number of MSAA samples for antialiasing.
 pub const MSAA_SAMPLES: u32 = 4;
+
+/// Convert a single sRGB channel value to linear.
+///
+/// livesplit-core provides colors in sRGB space. When the render target uses
+/// an sRGB format, wgpu automatically applies linear→sRGB encoding on write.
+/// Without converting input colors to linear first, they would be
+/// double-encoded (washed out, with reduced contrast between dark shades).
+fn srgb_channel_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
 
 /// Uniform data for the path shader, uploaded as a uniform buffer.
 ///
@@ -58,7 +73,9 @@ struct ImageUniformData {
     brightness: f32,
     opacity: f32,
     flip_uv_y: i32,
-    _pad0: i32,
+    /// When non-zero, the texture content is already premultiplied and the
+    /// shader should skip the premultiplication step.  Used by FBO blitting.
+    already_premultiplied: i32,
     _pad1: i32,
     _pad2: i32,
 }
@@ -79,60 +96,6 @@ struct BlurCache {
     bind_group: Arc<wgpu::BindGroup>,
 }
 
-/// A GPU buffer that grows to accommodate the largest data written to it.
-///
-/// Avoids per-draw buffer allocation by reusing a single buffer that is
-/// resized (via reallocation) only when a larger payload is needed.
-struct GrowableBuffer {
-    buffer: wgpu::Buffer,
-    capacity: u64,
-    usage: wgpu::BufferUsages,
-}
-
-impl GrowableBuffer {
-    fn new(device: &wgpu::Device, usage: wgpu::BufferUsages, initial_capacity: u64) -> Self {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: initial_capacity,
-            usage: usage | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        Self {
-            buffer,
-            capacity: initial_capacity,
-            usage,
-        }
-    }
-
-    /// Write data into the buffer, growing it if necessary.
-    fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
-        let len = data.len() as u64;
-        if len == 0 {
-            return;
-        }
-        if len > self.capacity {
-            // Grow to at least 2× or the needed size, whichever is larger.
-            let new_capacity = len.max(self.capacity * 2);
-            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: new_capacity,
-                usage: self.usage | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.capacity = new_capacity;
-        }
-        queue.write_buffer(&self.buffer, 0, data);
-    }
-}
-
-/// Shared vertex and index buffers, wrapped in [`RefCell`] to allow mutable
-/// access from `&self` draw methods (needed because the scene borrow from
-/// `SceneManager` prevents `&mut self`).
-struct Buffers {
-    vertex: GrowableBuffer,
-    index: GrowableBuffer,
-}
-
 /// A GPU-accelerated renderer for livesplit-core layouts using wgpu.
 ///
 /// Renders a livesplit-core [`LayoutState`] to a wgpu texture using two
@@ -151,7 +114,7 @@ struct Buffers {
 /// # Example
 ///
 /// ```no_run
-/// # use livesplit_renderer_glow::WgpuRenderer;
+/// # use livesplit_renderer_gpu::WgpuRenderer;
 /// # fn example(device: &wgpu::Device, queue: &wgpu::Queue,
 /// #            state: &livesplit_core::layout::LayoutState,
 /// #            image_cache: &livesplit_core::settings::ImageCache,
@@ -159,7 +122,8 @@ struct Buffers {
 /// let mut renderer = WgpuRenderer::new(device, wgpu::TextureFormat::Bgra8UnormSrgb);
 ///
 /// // Each frame:
-/// let new_size = renderer.render(device, queue, state, image_cache, [800, 600], &output_view);
+/// let new_size = renderer.render(device, queue, state, image_cache,
+///                                [800, 600], &output_view, true);
 /// # }
 /// ```
 pub struct WgpuRenderer {
@@ -188,11 +152,6 @@ pub struct WgpuRenderer {
     /// The surface/output texture format.
     format: wgpu::TextureFormat,
 
-    /// Reusable vertex and index buffers. In a [`RefCell`] because draw
-    /// methods need mutable buffer access while the scene graph is borrowed
-    /// immutably from [`scene_manager`](Self::scene_manager).
-    buffers: RefCell<Buffers>,
-
     /// Off-screen resolve texture (non-MSAA) for the cached bottom layer.
     fbo_texture: Option<wgpu::Texture>,
     /// Texture view for the resolve target.
@@ -212,6 +171,32 @@ pub struct WgpuRenderer {
     /// Cached blurred background image texture, reused across frames when
     /// the source image and blur setting are unchanged.
     blur_cache: Option<BlurCache>,
+
+    /// Cached GPU buffers for the scene's unit rectangle (a static quad).
+    /// Created on first use and reused across all frames.
+    rect_buffers: OnceCell<RectBuffers>,
+
+    /// Per-frame buffer pool for uniforms, vertices, and indices.
+    /// Avoids creating thousands of tiny GPU buffers per second.
+    /// Wrapped in `RefCell` to allow mutable access from `&self` draw
+    /// methods while `scene_manager` is immutably borrowed.
+    buffer_pool: RefCell<FrameBufferPool>,
+
+    /// Cached bind group for path uniform buffer (one per buffer, not
+    /// per draw call). Invalidated when the pool's uniform buffer grows.
+    path_uniform_bind_group: RefCell<Option<wgpu::BindGroup>>,
+    /// Cached bind group for image uniform buffer.
+    image_uniform_bind_group: RefCell<Option<wgpu::BindGroup>>,
+    /// The pool's uniform generation when the cached bind groups were
+    /// created. Used to detect buffer growth and invalidate caches.
+    cached_uniform_generation: RefCell<u64>,
+}
+
+/// Cached GPU vertex and index buffers for the unit rectangle quad.
+struct RectBuffers {
+    vertex: wgpu::Buffer,
+    index: wgpu::Buffer,
+    index_count: u32,
 }
 
 impl WgpuRenderer {
@@ -230,8 +215,11 @@ impl WgpuRenderer {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                            PathUniformData,
+                        >()
+                            as u64),
                     },
                     count: None,
                 }],
@@ -245,8 +233,11 @@ impl WgpuRenderer {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<
+                            ImageUniformData,
+                        >()
+                            as u64),
                     },
                     count: None,
                 }],
@@ -291,15 +282,8 @@ impl WgpuRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
-        });
-
-        // Initial buffer sizes: 4 KiB for vertices/indices is enough for
-        // several hundred-vertex paths before any reallocation is needed.
-        let buffers = RefCell::new(Buffers {
-            vertex: GrowableBuffer::new(device, wgpu::BufferUsages::VERTEX, 4096),
-            index: GrowableBuffer::new(device, wgpu::BufferUsages::INDEX, 4096),
         });
 
         let mut allocator = WgpuAllocator::new();
@@ -315,7 +299,6 @@ impl WgpuRenderer {
             image_texture_bind_group_layout,
             sampler,
             format,
-            buffers,
             fbo_texture: None,
             fbo_texture_view: None,
             msaa_texture: None,
@@ -323,6 +306,11 @@ impl WgpuRenderer {
             fbo_size: [0, 0],
             bottom_layer_dirty: true,
             blur_cache: None,
+            rect_buffers: OnceCell::new(),
+            buffer_pool: RefCell::new(FrameBufferPool::new(device)),
+            path_uniform_bind_group: RefCell::new(None),
+            image_uniform_bind_group: RefCell::new(None),
+            cached_uniform_generation: RefCell::new(u64::MAX),
         }
     }
 
@@ -335,6 +323,7 @@ impl WgpuRenderer {
     ///
     /// Panics if off-screen textures have not been initialized (i.e., if
     /// the viewport dimensions are zero).
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -343,10 +332,13 @@ impl WgpuRenderer {
         image_cache: &ImageCache,
         [width, height]: [u32; 2],
         output_view: &wgpu::TextureView,
+        draw_background: bool,
     ) -> Option<[f32; 2]> {
         if width == 0 || height == 0 {
             return None;
         }
+
+        self.buffer_pool.borrow_mut().begin_frame();
 
         // Precision loss is acceptable: viewport dimensions are small
         // relative to f32 mantissa range.
@@ -410,14 +402,18 @@ impl WgpuRenderer {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
+                        depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
 
-                if let Some(bg) = scene.background() {
-                    self.render_background(device, queue, &mut pass, bg, resolution);
+                if draw_background {
+                    if let Some(bg) = scene.background() {
+                        self.render_background(device, queue, &mut pass, bg, resolution);
+                    }
                 }
 
                 for entity in scene.bottom_layer() {
@@ -444,10 +440,12 @@ impl WgpuRenderer {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Blit cached bottom layer.
@@ -604,9 +602,59 @@ impl WgpuRenderer {
         }
     }
 
+    /// Lazily create or refresh the cached path and image uniform bind
+    /// groups. Both bind the entire pool uniform buffer at offset 0 with
+    /// `has_dynamic_offset: true`, so the per-draw offset is passed via
+    /// `set_bind_group`'s dynamic offset array.
+    ///
+    /// Only recreates when the pool's uniform buffer has been replaced
+    /// (i.e., the generation counter changed due to growth).
+    fn ensure_uniform_bind_groups(&self, device: &wgpu::Device) {
+        let pool = self.buffer_pool.borrow();
+        let gen = pool.uniform_generation();
+        if *self.cached_uniform_generation.borrow() == gen {
+            return;
+        }
+
+        *self.path_uniform_bind_group.borrow_mut() =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("path_uniform_bind_group"),
+                layout: &self.path_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &pool.uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<PathUniformData>() as u64
+                        ),
+                    }),
+                }],
+            }));
+
+        *self.image_uniform_bind_group.borrow_mut() =
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("image_uniform_bind_group"),
+                layout: &self.image_uniform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &pool.uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<ImageUniformData>() as u64
+                        ),
+                    }),
+                }],
+            }));
+
+        *self.cached_uniform_generation.borrow_mut() = gen;
+    }
+
     /// Draw a filled path with the given shader and transform.
     ///
-    /// Reuses the renderer's vertex and index buffers, growing them as needed.
+    /// Uniform, vertex, and index data are sub-allocated from the per-frame
+    /// buffer pool, avoiding per-draw-call GPU buffer creation.
     #[allow(clippy::too_many_arguments)]
     fn draw_path(
         &self,
@@ -622,51 +670,71 @@ impl WgpuRenderer {
             return;
         }
 
-        let uniform_data = Self::build_path_uniforms(shader, path, transform, resolution);
+        let uniform_data = self.build_path_uniforms(shader, path, transform, resolution);
 
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("path_uniform_buffer"),
-            contents: bytemuck::bytes_of(&uniform_data),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let (uniform_alloc, vertex_alloc, index_alloc) = {
+            let mut pool = self.buffer_pool.borrow_mut();
+            let u = pool.alloc_uniform(device, queue, bytemuck::bytes_of(&uniform_data));
+            let v = pool.alloc_vertex(device, queue, bytemuck::cast_slice(&path.vertices));
+            let i = pool.alloc_index(device, queue, bytemuck::cast_slice(&path.indices));
+            (u, v, i)
+        };
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("path_bind_group"),
-            layout: &self.path_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        let mut bufs = self.buffers.borrow_mut();
-        bufs.vertex
-            .write(device, queue, bytemuck::cast_slice(&path.vertices));
-        bufs.index
-            .write(device, queue, bytemuck::cast_slice(&path.indices));
+        self.ensure_uniform_bind_groups(device);
+        let pool = self.buffer_pool.borrow();
+        let bg = self.path_uniform_bind_group.borrow();
+        let bind_group = bg.as_ref().expect("path bind group not initialized");
 
         pass.set_pipeline(&self.path_pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.set_vertex_buffer(0, bufs.vertex.buffer.slice(..));
-        pass.set_index_buffer(bufs.index.buffer.slice(..), wgpu::IndexFormat::Uint32);
+        #[expect(clippy::cast_possible_truncation)]
+        pass.set_bind_group(0, bind_group, &[uniform_alloc.offset as u32]);
+        pass.set_vertex_buffer(
+            0,
+            pool.vertex_buffer
+                .slice(vertex_alloc.offset..vertex_alloc.offset + vertex_alloc.size),
+        );
+        pass.set_index_buffer(
+            pool.index_buffer
+                .slice(index_alloc.offset..index_alloc.offset + index_alloc.size),
+            wgpu::IndexFormat::Uint32,
+        );
         #[expect(clippy::cast_possible_truncation)]
         pass.draw_indexed(0..path.indices.len() as u32, 0, 0..1);
     }
 
     /// Build the uniform data for a path draw call.
+    ///
+    /// When the render target uses an sRGB format, colors from livesplit-core
+    /// (which are in sRGB space) are converted to linear so the GPU's automatic
+    /// linear→sRGB encoding reproduces the original values. Without this,
+    /// colors would be double-encoded and appear washed out.
     fn build_path_uniforms(
+        &self,
         shader: &FillShader,
         path: &WgpuPath,
         transform: &Transform,
         resolution: [f32; 2],
     ) -> PathUniformData {
+        let convert = |c: &[f32; 4]| -> [f32; 4] {
+            if self.format.is_srgb() {
+                [
+                    srgb_channel_to_linear(c[0]),
+                    srgb_channel_to_linear(c[1]),
+                    srgb_channel_to_linear(c[2]),
+                    c[3], // alpha is always linear
+                ]
+            } else {
+                *c
+            }
+        };
+
         match shader {
             FillShader::SolidColor(color) => PathUniformData {
                 scale: [transform.scale_x, transform.scale_y],
                 offset: [transform.x, transform.y],
                 resolution,
                 bounds: [0.0, 0.0],
-                color_a: *color,
+                color_a: convert(color),
                 color_b: [0.0; 4],
                 shader_type: 0,
                 _pad0: 0,
@@ -680,8 +748,8 @@ impl WgpuRenderer {
                     offset: [transform.x, transform.y],
                     resolution,
                     bounds: [min, max],
-                    color_a: *top,
-                    color_b: *bottom,
+                    color_a: convert(top),
+                    color_b: convert(bottom),
                     shader_type: 1,
                     _pad0: 0,
                     _pad1: 0,
@@ -695,8 +763,8 @@ impl WgpuRenderer {
                     offset: [transform.x, transform.y],
                     resolution,
                     bounds: [min, max],
-                    color_a: *left,
-                    color_b: *right,
+                    color_a: convert(left),
+                    color_b: convert(right),
                     shader_type: 2,
                     _pad0: 0,
                     _pad1: 0,
@@ -789,7 +857,7 @@ impl WgpuRenderer {
             brightness: 1.0,
             opacity: 1.0,
             flip_uv_y: 0,
-            _pad0: 0,
+            already_premultiplied: 0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -944,7 +1012,7 @@ impl WgpuRenderer {
             brightness: bg_image.brightness,
             opacity: bg_image.opacity,
             flip_uv_y: 0,
-            _pad0: 0,
+            already_premultiplied: 0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -963,38 +1031,43 @@ impl WgpuRenderer {
         uniform_data: &ImageUniformData,
         texture_bind_group: &wgpu::BindGroup,
     ) {
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("image_uniform_buffer"),
-            contents: bytemuck::bytes_of(uniform_data),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let uniform_alloc = {
+            let mut pool = self.buffer_pool.borrow_mut();
+            pool.alloc_uniform(device, queue, bytemuck::bytes_of(uniform_data))
+        };
 
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("image_uniform_bind_group"),
-            layout: &self.image_uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
+        self.ensure_uniform_bind_groups(device);
+        let bg = self.image_uniform_bind_group.borrow();
+        let uniform_bind_group = bg.as_ref().expect("image bind group not initialized");
 
-        let scene = self.scene_manager.scene();
-        let rect = scene.rectangle();
-        if let Some(path) = rect.as_ref() {
-            let mut bufs = self.buffers.borrow_mut();
-            bufs.vertex
-                .write(device, queue, bytemuck::cast_slice(&path.vertices));
-            bufs.index
-                .write(device, queue, bytemuck::cast_slice(&path.indices));
-
-            pass.set_pipeline(&self.image_pipeline);
-            pass.set_bind_group(0, &uniform_bind_group, &[]);
-            pass.set_bind_group(1, texture_bind_group, &[]);
-            pass.set_vertex_buffer(0, bufs.vertex.buffer.slice(..));
-            pass.set_index_buffer(bufs.index.buffer.slice(..), wgpu::IndexFormat::Uint32);
+        let rect_bufs = self.rect_buffers.get_or_init(|| {
+            let scene = self.scene_manager.scene();
+            let rect = scene.rectangle();
+            let path = rect.as_ref().expect("scene rectangle not initialized");
             #[expect(clippy::cast_possible_truncation)]
-            pass.draw_indexed(0..path.indices.len() as u32, 0, 0..1);
-        }
+            let index_count = path.indices.len() as u32;
+            RectBuffers {
+                vertex: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rect_vertex_buffer"),
+                    contents: bytemuck::cast_slice(&path.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                index: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rect_index_buffer"),
+                    contents: bytemuck::cast_slice(&path.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                index_count,
+            }
+        });
+
+        pass.set_pipeline(&self.image_pipeline);
+        #[expect(clippy::cast_possible_truncation)]
+        pass.set_bind_group(0, uniform_bind_group, &[uniform_alloc.offset as u32]);
+        pass.set_bind_group(1, texture_bind_group, &[]);
+        pass.set_vertex_buffer(0, rect_bufs.vertex.slice(..));
+        pass.set_index_buffer(rect_bufs.index.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..rect_bufs.index_count, 0, 0..1);
     }
 
     /// Blit the cached bottom-layer texture to the current render pass as a
@@ -1032,8 +1105,8 @@ impl WgpuRenderer {
             resolution,
             brightness: 1.0,
             opacity: 1.0,
-            flip_uv_y: 1,
-            _pad0: 0,
+            flip_uv_y: 0,
+            already_premultiplied: 1,
             _pad1: 0,
             _pad2: 0,
         };
@@ -1112,5 +1185,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ImageUniformData, brightness), 24);
         assert_eq!(std::mem::offset_of!(ImageUniformData, opacity), 28);
         assert_eq!(std::mem::offset_of!(ImageUniformData, flip_uv_y), 32);
+        assert_eq!(
+            std::mem::offset_of!(ImageUniformData, already_premultiplied),
+            36
+        );
     }
 }

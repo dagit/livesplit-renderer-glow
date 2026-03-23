@@ -115,7 +115,7 @@ struct ImageUniforms {
     brightness: f32,
     opacity: f32,
     flip_uv_y: i32,
-    _pad0: i32,
+    already_premultiplied: i32,
     _pad1: i32,
     _pad2: i32,
 }
@@ -158,8 +158,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     var frag_color = textureSample(t_texture, s_sampler, in.uv);
     frag_color = vec4f(frag_color.rgb * iu.brightness, frag_color.a);
     frag_color = vec4f(frag_color.rgb, frag_color.a * iu.opacity);
-    // Premultiply alpha
-    frag_color = vec4f(frag_color.rgb * frag_color.a, frag_color.a);
+    // Premultiply alpha (skip if content is already premultiplied, e.g. FBO blit)
+    if iu.already_premultiplied == 0 {
+        frag_color = vec4f(frag_color.rgb * frag_color.a, frag_color.a);
+    }
     return frag_color;
 }
 ";
@@ -182,7 +184,7 @@ pub fn create_path_pipeline(
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("path_pipeline_layout"),
         bind_group_layouts: &[path_bind_group_layout],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -238,7 +240,7 @@ pub fn create_path_pipeline(
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -265,7 +267,7 @@ pub fn create_image_pipeline(
             image_uniform_bind_group_layout,
             image_texture_bind_group_layout,
         ],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -321,7 +323,7 @@ pub fn create_image_pipeline(
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

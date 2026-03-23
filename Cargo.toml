@@ -1,21 +1,30 @@
 [package]
-name = "livesplit-renderer-glow"
+name = "livesplit-renderer-gpu"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-description = "A GPU-accelerated renderer for livesplit-core using OpenGL via glow"
-repository = "https://github.com/dagit/livesplit-renderer-glow"
-keywords = ["livesplit", "opengl", "glow", "rendering", "speedrun"]
+description = "GPU-accelerated renderers for livesplit-core (OpenGL via glow and wgpu)"
+repository = "https://github.com/dagit/livesplit-renderer-gpu"
+readme = "README.md"
+keywords = ["livesplit", "opengl", "glow", "wgpu", "speedrun"]
 categories = ["rendering", "graphics"]
+
+[features]
+default = ["glow", "wgpu"]
+glow = ["dep:glow"]
+wgpu = ["dep:wgpu"]
 
 [dependencies]
 livesplit-core = { git = "https://github.com/LiveSplit/livesplit-core", features = ["default-text-engine", "font-loading"] }
-glow = "0.16"
-wgpu = "25"
+glow = { version = "0.16", optional = true }
+wgpu = { version = "28", optional = true }
 lyon = "1"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints.rust]
 missing_docs = "warn"

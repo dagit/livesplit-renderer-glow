@@ -36,7 +36,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo clippy --no-default-features --features glow -- -D warnings
+      - run: cargo clippy --no-default-features --features wgpu -- -D warnings
 
   test:
     name: Tests
@@ -47,7 +49,7 @@ jobs:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+      - run: cargo test --all-features
 
   doc:
     name: Documentation
@@ -60,7 +62,7 @@ jobs:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps
+      - run: cargo doc --all-features --no-deps
 
   msrv:
     name: MSRV (1.89)
@@ -73,4 +75,4 @@ jobs:
         with:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
+      - run: cargo check --all-features

@@ -101,7 +101,7 @@ struct BlurCache {
 /// # Example
 ///
 /// ```no_run
-/// # use livesplit_renderer_glow::GlowRenderer;
+/// # use livesplit_renderer_gpu::GlowRenderer;
 /// # use std::sync::Arc;
 /// # fn example(gl: Arc<glow::Context>, state: &livesplit_core::layout::LayoutState,
 /// #            image_cache: &livesplit_core::settings::ImageCache) {
@@ -109,7 +109,7 @@ struct BlurCache {
 /// let mut renderer = unsafe { GlowRenderer::new(gl) }.unwrap();
 ///
 /// // Each frame:
-/// let new_size = unsafe { renderer.render(state, image_cache, [800, 600]) };
+/// let new_size = unsafe { renderer.render(state, image_cache, [800, 600], true) };
 /// # }
 /// ```
 pub struct GlowRenderer {
@@ -324,6 +324,7 @@ impl GlowRenderer {
         state: &LayoutState,
         image_cache: &ImageCache,
         [width, height]: [u32; 2],
+        draw_background: bool,
     ) -> Option<[f32; 2]> {
         if width == 0 || height == 0 {
             return None;
@@ -387,8 +388,10 @@ impl GlowRenderer {
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
 
-            if let Some(bg) = scene.background() {
-                unsafe { self.render_background(bg, resolution) };
+            if draw_background {
+                if let Some(bg) = scene.background() {
+                    unsafe { self.render_background(bg, resolution) };
+                }
             }
 
             for entity in scene.bottom_layer() {
