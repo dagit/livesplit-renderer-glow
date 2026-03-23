@@ -2,7 +2,7 @@
 name = "livesplit-renderer-gpu"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 description = "GPU-accelerated renderers for livesplit-core (OpenGL via glow and wgpu)"
 repository = "https://github.com/dagit/livesplit-renderer-gpu"
