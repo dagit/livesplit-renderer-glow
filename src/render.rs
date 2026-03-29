@@ -377,9 +377,15 @@ impl GlowRenderer {
 
         let gl = &self.gl;
 
-        // Save and disable scissor test — the caller (e.g. egui paint callback)
-        // may have scissor enabled, which would corrupt our FBO clears and blits.
+        // Save caller's GL state that we will modify.
         let scissor_was_enabled = unsafe { gl.is_enabled(glow::SCISSOR_TEST) };
+        // Save the framebuffer the caller wants us to render into (usually the
+        // default FB / 0, but could be an intermediate FBO from egui).
+        let caller_fbo = unsafe {
+            #[expect(clippy::cast_sign_loss)]
+            let raw = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING) as u32;
+            std::num::NonZeroU32::new(raw).map(glow::NativeFramebuffer)
+        };
         unsafe { gl.disable(glow::SCISSOR_TEST) };
 
         unsafe {
@@ -447,10 +453,10 @@ impl GlowRenderer {
             unsafe { self.render_entity(entity, resolution) };
         }
 
-        // Resolve MSAA to default framebuffer (screen).
+        // Resolve MSAA to the caller's framebuffer.
         unsafe {
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.msaa_fbo));
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, caller_fbo);
             gl.blit_framebuffer(
                 0,
                 0,
@@ -465,9 +471,15 @@ impl GlowRenderer {
             );
 
             gl.disable(glow::BLEND);
+            // Ensure the blit completes before the caller (or the windowing
+            // system) touches the framebuffer — some X11 drivers need this.
+            gl.flush();
         }
 
-        // Restore scissor test to whatever the caller had.
+        // Restore caller's GL state.
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, caller_fbo);
+        }
         if scissor_was_enabled {
             unsafe { gl.enable(glow::SCISSOR_TEST) };
         }
